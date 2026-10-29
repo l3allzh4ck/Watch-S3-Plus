@@ -1,5 +1,5 @@
 /**
- * @file      factory.ino
+ * @file      factory.cpp
  * @author    Lewis He (lewishe@outlook.com)
  * @license   MIT
  * @copyright Copyright (c) 2025  ShenZhen XinYuan Electronic Technology Co., Ltd
