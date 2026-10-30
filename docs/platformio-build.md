@@ -6,9 +6,27 @@ against those local sources.
 
 Target: LilyGO T-Watch S3 Plus (ESP32-S3, 16MB flash, 8MB OPI PSRAM, SX1262).
 
+## One-time setup (Windows)
+
+The project uses the [pioarduino](https://github.com/pioarduino/platform-espressif32)
+platform, which needs the **pioarduino IDE** VS Code extension rather than
+PlatformIO IDE (both use `%USERPROFILE%\.platformio\penv`).
+
+1. Disable or uninstall **PlatformIO IDE**, install **pioarduino IDE**, restart VS Code.
+2. Enable Windows long paths (administrator PowerShell, then reboot). The
+   framework package contains paths long enough to stall unpacking otherwise:
+   ```powershell
+   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+   ```
+3. Pin pioarduino Core to 6.2.0 (with VS Code closed). Core `6.2.0.post1`
+   rejects platform 55.03.312 as requiring Core `>=6.2.0`:
+   ```powershell
+   & "$env:USERPROFILE\.platformio\penv\Scripts\uv.exe" pip install --python "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "pioarduino==6.2.0"
+   ```
+
 ## Build
 
-1. Open the repository folder in VS Code with the PlatformIO extension.
+1. Open the repository folder in VS Code with the pioarduino IDE extension.
 2. Select the `twatchs3` environment (the default).
 3. Click **Build** (the tick in the status bar).
 
