@@ -36,7 +36,7 @@ plus `bootloader.bin` (`0x0`) and `partitions.bin` (`0x8000`).
 
 ## Verified baseline
 
-Built with Arduino ESP32 core 3.3.12 (GCC 14.2.0):
+Built with the pioarduino platform 55.03.312 (Arduino ESP32 core 3.3.12, GCC 14.2.0):
 
 ```
 RAM:   25.1% (82176 / 327680 bytes)
