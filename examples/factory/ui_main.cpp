@@ -1834,6 +1834,11 @@ void setupGui()
     register_app("BLE Scan", &img_bluetooth, &ui_ble_scanner_main);
 #endif
 
+#if !defined(EXCLUDE_FOX_HUNT)
+    extern app_t ui_fox_hunt_main;
+    register_app("Fox Hunt", &img_scan, &ui_fox_hunt_main);
+#endif
+
 #if !defined(EXCLUDE_BLE_HID)
     register_app("BLE HID", &img_bluetooth, &ui_ble_hid_main);
 #endif
