@@ -107,6 +107,8 @@ static uint32_t fox_next_list_ms = 0;
 static bool    fox_crest_latched = false;
 static bool    fox_has_codec = false;
 static bool    fox_has_haptic = false;
+static int     fox_last_qb = -1;         /* quantised glow brightness */
+static uint32_t fox_last_glow_color = 0xFFFFFFFFu;
 
 #if FOX_HUNT_HAS_NIMBLE
 
@@ -396,57 +398,55 @@ static const char *fox_fb_text(fox_fb_t fb)
     }
 }
 
-/* Paint one edge glow panel with a colour->transparent fade toward centre. */
-static void fox_style_glow(lv_obj_t *panel, uint8_t edge, uint32_t color)
+/* Scale an RGB colour toward black by brightness (0..1). */
+static uint32_t fox_scale_color(uint32_t rgb, float b)
 {
-    lv_color_t c = lv_color_hex(color);
-    lv_obj_set_style_bg_color(panel, c, 0);
-    lv_obj_set_style_bg_grad_color(panel, c, 0);
+    if (b < 0.0f) {
+        b = 0.0f;
+    }
+    if (b > 1.0f) {
+        b = 1.0f;
+    }
+    uint32_t r = (uint32_t)(((rgb >> 16) & 0xFF) * b);
+    uint32_t g = (uint32_t)(((rgb >> 8) & 0xFF) * b);
+    uint32_t bl = (uint32_t)((rgb & 0xFF) * b);
+    return (r << 16) | (g << 8) | bl;
+}
+
+/* Set an edge panel's gradient direction and anchor its inner end to black.
+ * The screen background is black, so a colour->black gradient reads as a
+ * colour->transparent fade without needing an alpha gradient or a render
+ * layer (which corrupts large panels on this display). */
+static void fox_style_glow_dir(lv_obj_t *panel, uint8_t edge)
+{
+    lv_color_t black = lv_color_black();
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_main_stop(panel, 0, 0);
     lv_obj_set_style_bg_grad_stop(panel, 255, 0);
-
-    switch (edge) {
-    case 0: /* top: opaque at top edge, fading down */
-        lv_obj_set_style_bg_grad_dir(panel, LV_GRAD_DIR_VER, 0);
-        lv_obj_set_style_bg_main_opa(panel, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_grad_opa(panel, LV_OPA_TRANSP, 0);
-        break;
-    case 1: /* bottom: opaque at bottom edge, fading up */
-        lv_obj_set_style_bg_grad_dir(panel, LV_GRAD_DIR_VER, 0);
-        lv_obj_set_style_bg_main_opa(panel, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_bg_grad_opa(panel, LV_OPA_COVER, 0);
-        break;
-    case 2: /* left: opaque at left edge, fading right */
-        lv_obj_set_style_bg_grad_dir(panel, LV_GRAD_DIR_HOR, 0);
-        lv_obj_set_style_bg_main_opa(panel, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_grad_opa(panel, LV_OPA_TRANSP, 0);
-        break;
-    default: /* right: opaque at right edge, fading left */
-        lv_obj_set_style_bg_grad_dir(panel, LV_GRAD_DIR_HOR, 0);
-        lv_obj_set_style_bg_main_opa(panel, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_bg_grad_opa(panel, LV_OPA_COVER, 0);
-        break;
+    lv_obj_set_style_bg_grad_dir(panel, (edge < 2) ? LV_GRAD_DIR_VER : LV_GRAD_DIR_HOR, 0);
+    /* edge colour lives on: top/left = main end, bottom/right = grad end. */
+    if (edge == 0 || edge == 2) {
+        lv_obj_set_style_bg_grad_color(panel, black, 0); /* inner end black */
+    } else {
+        lv_obj_set_style_bg_color(panel, black, 0);      /* inner end black */
     }
 }
 
-static void fox_set_glow_color(uint32_t color)
+/* Apply band colour at the chosen brightness to the four panels' edges. */
+static void fox_apply_glow(uint32_t color, float brightness)
 {
-    for (uint8_t i = 0; i < 4; i++) {
-        if (fox_glow[i]) {
-            lv_color_t c = lv_color_hex(color);
-            lv_obj_set_style_bg_color(fox_glow[i], c, 0);
-            lv_obj_set_style_bg_grad_color(fox_glow[i], c, 0);
-        }
+    lv_color_t lc = lv_color_hex(fox_scale_color(color, brightness));
+    if (fox_glow[0]) {
+        lv_obj_set_style_bg_color(fox_glow[0], lc, 0);
     }
-}
-
-static void fox_set_glow_opa(lv_opa_t opa)
-{
-    for (uint8_t i = 0; i < 4; i++) {
-        if (fox_glow[i]) {
-            lv_obj_set_style_opa(fox_glow[i], opa, 0);
-        }
+    if (fox_glow[2]) {
+        lv_obj_set_style_bg_color(fox_glow[2], lc, 0);
+    }
+    if (fox_glow[1]) {
+        lv_obj_set_style_bg_grad_color(fox_glow[1], lc, 0);
+    }
+    if (fox_glow[3]) {
+        lv_obj_set_style_bg_grad_color(fox_glow[3], lc, 0);
     }
 }
 
@@ -722,7 +722,6 @@ static void fox_tick_cb(lv_timer_t *timer)
 
     if (band != fox_band) {
         fox_band = band;
-        fox_set_glow_color(fox_band_color(band));
         if (fox_band_label) {
             lv_label_set_text(fox_band_label, fox_band_text(band));
             lv_obj_set_style_text_color(fox_band_label, lv_color_hex(fox_band_color(band)), 0);
@@ -745,7 +744,7 @@ static void fox_tick_cb(lv_timer_t *timer)
         }
     }
 
-    /* Pulse the glow; cadence tracks the band. */
+    /* Pulse the glow by scaling edge brightness; cadence tracks the band. */
     uint32_t period = fox_band_period(band);
     fox_pulse_phase_ms += dt;
     bool crest = false;
@@ -756,20 +755,25 @@ static void fox_tick_cb(lv_timer_t *timer)
     float phase = (float)fox_pulse_phase_ms / (float)period;      /* 0..1 */
     float wave = 0.5f - 0.5f * cosf(phase * 2.0f * (float)M_PI);  /* 0..1, crest at phase 0/1 */
 
-    lv_opa_t opa;
+    uint32_t color = fox_band_color(band);
+    float brightness;
     if (band == FOX_BAND_NONE) {
-        opa = (lv_opa_t)70; /* faint steady grey while searching */
+        brightness = 0.35f; /* faint steady while searching */
     } else {
-        /* brighter and deeper pulse the hotter we are */
-        int base = 60 + (int)band * 20;      /* 80..140 */
-        int amp = 60 + (int)band * 15;        /* 75..120 */
-        int v = base + (int)(amp * wave);
-        if (v > 255) {
-            v = 255;
+        float base = 0.40f + 0.06f * (float)band; /* 0.46..0.64 */
+        float amp = 0.30f + 0.05f * (float)band;  /* 0.35..0.50 */
+        brightness = base + amp * wave;
+        if (brightness > 1.0f) {
+            brightness = 1.0f;
         }
-        opa = (lv_opa_t)v;
     }
-    fox_set_glow_opa(opa);
+    /* Quantise to limit gradient redraws. */
+    int qb = (int)(brightness * 12.0f + 0.5f);
+    if (qb != fox_last_qb || color != fox_last_glow_color) {
+        fox_apply_glow(color, (float)qb / 12.0f);
+        fox_last_qb = qb;
+        fox_last_glow_color = color;
+    }
 
     /* Feedback on the crest. */
     if (crest && !fox_crest_latched) {
@@ -803,6 +807,8 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
     fox_last_tick_ms = 0;
     fox_next_list_ms = 0;
     fox_crest_latched = false;
+    fox_last_qb = -1;
+    fox_last_glow_color = 0xFFFFFFFFu;
 
 #ifdef ARDUINO
     uint32_t online = hw_get_device_online();
@@ -848,10 +854,10 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
             lv_obj_set_size(g, (sw * 42) / 100, sh);
         }
         lv_obj_align(g, aligns[i], 0, 0);
-        fox_style_glow(g, edges[i], fox_band_color(FOX_BAND_NONE));
-        lv_obj_set_style_opa(g, 70, 0);
+        fox_style_glow_dir(g, edges[i]);
         fox_glow[i] = g;
     }
+    fox_apply_glow(fox_band_color(FOX_BAND_NONE), 0.35f);
 
     /* Top bar: back, target dropdown, gear. */
     fox_back_btn = lv_btn_create(fox_root);
