@@ -2,21 +2,17 @@
  * @file      ui_fox_hunt.cpp
  * @license   MIT
  *
- * BLE Fox Hunt — pick a nearby BLE beacon and home in on it by signal
- * strength. Built on NimBLE observer scanning, like the BLE Scanner app.
+ * BLE Fox Hunt — pick a nearby BLE device and home in on it by signal
+ * strength. Built on the factory card-page framework (ui_create_app_page)
+ * and NimBLE observer scanning, like the BLE Scanner app.
  *
- * Interface (round 240x240 touch display, few physical buttons):
- *   - A coloured glow around the edge of the screen replaces status LEDs.
- *     It fades inward and is tinted by the proximity band, pulsing faster
- *     the closer you are: FREEZING (blue) -> COLD (cyan) -> WARM (amber)
- *     -> HOT (red).
- *   - Tap the left third of the screen to lower feedback volume, the right
- *     third to raise it. 0 = silent (glow only).
- *   - Swipe in from the left or right bezel to go back.
- *   - A gear (top-right) opens smoothing / range / feedback settings.
- *
- * Feedback is a mix of haptic pulses and beeps, each firing on the glow
- * crest; cadence and pitch track the proximity band.
+ * A large "signal" panel shows the proximity band and smoothed RSSI, and
+ * pulses in the band colour (FREEZING blue -> COLD cyan -> WARM amber ->
+ * HOT red) in place of status LEDs. Tap its left/right half to lower/raise
+ * feedback volume. Feedback is a mix of haptic pulses and beeps whose
+ * cadence and pitch track the band. The target dropdown chooses which
+ * device to hunt (or Auto = strongest). Smoothing, range tuning, feedback
+ * type and volume are adjustable.
  */
 #include "ui_define.h"
 
@@ -46,25 +42,22 @@ using std::string;
 #include <math.h>
 
 /* ── Tunables ── */
-#define FOX_UI_PERIOD_MS        80       /* glow / feedback tick */
-#define FOX_STALE_MS            4000     /* target lost after this */
-#define FOX_LIST_REBUILD_MS     1500     /* target dropdown refresh */
+#define FOX_UI_PERIOD_MS        100
+#define FOX_STALE_MS            4000
+#define FOX_LIST_REBUILD_MS     1500
 #define FOX_MAX_DEVICES         48
-#define FOX_MAX_PICK            16       /* devices listed in dropdown */
-#define FOX_EDGE_MARGIN         26       /* bezel kept clear for swipe */
+#define FOX_MAX_PICK            16
 #define FOX_VOL_MAX             5
 #define FOX_VOL_DEFAULT         3
 
-/* Proximity bands, strongest last. */
 typedef enum {
-    FOX_BAND_NONE = 0,   /* no / stale signal */
+    FOX_BAND_NONE = 0,
     FOX_BAND_FREEZING,
     FOX_BAND_COLD,
     FOX_BAND_WARM,
     FOX_BAND_HOT,
 } fox_band_t;
 
-/* Feedback mix. */
 typedef enum {
     FOX_FB_OFF = 0,
     FOX_FB_HAPTIC,
@@ -72,32 +65,28 @@ typedef enum {
     FOX_FB_BOTH,
 } fox_fb_t;
 
-/* Default band edges in dBm (applied to the smoothed, range-adjusted RSSI). */
 #define FOX_HOT_MIN_DBM         (-60)
 #define FOX_WARM_MIN_DBM        (-74)
 #define FOX_COLD_MIN_DBM        (-88)
 
-/* ── Persist within a session (static), reset on reboot. ── */
-static uint8_t fox_volume = FOX_VOL_DEFAULT;      /* 0..FOX_VOL_MAX */
-static int8_t  fox_range_tune = 0;                /* -10..+10 dB */
-static uint8_t fox_smoothing_idx = 1;             /* 0 Low, 1 Med, 2 High */
+/* Persist within a session (reset on reboot). */
+static uint8_t fox_volume = FOX_VOL_DEFAULT;
+static int8_t  fox_range_tune = 0;
+static uint8_t fox_smoothing_idx = 1;
 static fox_fb_t fox_feedback = FOX_FB_BOTH;
 
-/* ── UI objects ── */
-static lv_obj_t *fox_root = NULL;
-static lv_obj_t *fox_glow[4] = { NULL, NULL, NULL, NULL }; /* top,bottom,left,right */
-static lv_obj_t *fox_back_btn = NULL;
-static lv_obj_t *fox_gear_btn = NULL;
-static lv_obj_t *fox_target_dd = NULL;
+/* ── UI ── */
+static lv_obj_t *fox_page = NULL;        /* content from ui_create_app_page */
+static lv_obj_t *fox_signal_panel = NULL;
 static lv_obj_t *fox_band_label = NULL;
 static lv_obj_t *fox_rssi_label = NULL;
-static lv_obj_t *fox_sub_label = NULL;
 static lv_obj_t *fox_vol_label = NULL;
-static lv_obj_t *fox_fb_label = NULL;
-static lv_obj_t *fox_settings = NULL;   /* modal overlay, NULL when closed */
+static lv_obj_t *fox_sub_label = NULL;
+static lv_obj_t *fox_target_dd = NULL;
+static lv_obj_t *fox_vol_slider = NULL;
 static lv_timer_t *fox_timer = NULL;
 
-/* ── Runtime state (UI thread) ── */
+/* ── Runtime ── */
 static fox_band_t fox_band = FOX_BAND_NONE;
 static float   fox_smoothed = -100.0f;
 static bool    fox_have_smoothed = false;
@@ -107,11 +96,10 @@ static uint32_t fox_next_list_ms = 0;
 static bool    fox_crest_latched = false;
 static bool    fox_has_codec = false;
 static bool    fox_has_haptic = false;
-static int     fox_last_qb = -1;         /* quantised glow brightness */
-static uint32_t fox_last_glow_color = 0xFFFFFFFFu;
+static int     fox_last_qb = -1;
+static uint32_t fox_last_panel_color = 0xFFFFFFFFu;
 
 #if FOX_HUNT_HAS_NIMBLE
-
 typedef struct {
     string   address;
     uint8_t  address_type;
@@ -122,19 +110,15 @@ typedef struct {
 
 static SemaphoreHandle_t fox_mutex = NULL;
 static vector<fox_device_t> fox_devices;
-static string fox_target_addr;           /* empty => auto (strongest) */
+static string fox_target_addr;
 static uint8_t fox_target_type = 0;
 static volatile bool fox_app_active = false;
-static volatile bool fox_scan_running = false;
-
-/* index in dropdown (minus the Auto row) -> device address/type */
 static vector<std::pair<string, uint8_t>> fox_pick_map;
 
 static bool fox_lock(TickType_t ticks)
 {
     return fox_mutex && xSemaphoreTake(fox_mutex, ticks) == pdTRUE;
 }
-
 static void fox_unlock(void)
 {
     if (fox_mutex) {
@@ -188,7 +172,6 @@ class FoxScanCallbacks : public NimBLEScanCallbacks {
     void onDiscovered(const NimBLEAdvertisedDevice *d) override { fox_upsert(d); }
     void onResult(const NimBLEAdvertisedDevice *d) override { fox_upsert(d); }
 };
-
 static FoxScanCallbacks fox_scan_cb;
 
 static bool fox_start_scan(void)
@@ -204,13 +187,10 @@ static bool fox_start_scan(void)
     }
     scan->setScanCallbacks(&fox_scan_cb, false);
     scan->setActiveScan(true);
-    scan->setInterval(80);   /* 0.625ms units -> 50ms */
-    scan->setWindow(80);     /* 100% duty, catch ~250ms beacons fast */
-    scan->setMaxResults(0);  /* callback-only, no result cache */
-    /* duration 0 => scan until stopped */
-    bool ok = scan->start(0, false, true);
-    fox_scan_running = ok;
-    return ok;
+    scan->setInterval(80);
+    scan->setWindow(80);
+    scan->setMaxResults(0);
+    return scan->start(0, false, true);
 }
 
 static void fox_stop_scan(void)
@@ -226,11 +206,8 @@ static void fox_stop_scan(void)
             scan->clearResults();
         }
     }
-    fox_scan_running = false;
 }
 
-/* Latest RSSI for the active target (or strongest in auto mode). Returns
- * false if nothing suitable has been seen recently. */
 static bool fox_target_rssi(int8_t *rssi_out, string *name_out)
 {
     bool found = false;
@@ -240,7 +217,6 @@ static bool fox_target_rssi(int8_t *rssi_out, string *name_out)
         return false;
     }
     if (fox_target_addr.empty()) {
-        /* auto: strongest fresh device */
         for (const auto &d : fox_devices) {
             if ((uint32_t)(now - d.last_seen_ms) > FOX_STALE_MS) {
                 continue;
@@ -274,7 +250,6 @@ static bool fox_target_rssi(int8_t *rssi_out, string *name_out)
     return found;
 }
 
-/* Rebuild the "\n"-separated dropdown options from the device store. */
 static void fox_rebuild_target_list(void)
 {
     if (!fox_target_dd || !fox_lock(pdMS_TO_TICKS(10))) {
@@ -305,10 +280,8 @@ static void fox_rebuild_target_list(void)
         opts += label;
         fox_pick_map.push_back({ d.address, d.address_type });
     }
-
     lv_dropdown_set_options(fox_target_dd, opts.c_str());
 
-    /* keep the user's current selection highlighted */
     uint16_t sel = 0;
     if (!fox_target_addr.empty()) {
         for (size_t i = 0; i < fox_pick_map.size(); i++) {
@@ -321,10 +294,9 @@ static void fox_rebuild_target_list(void)
     }
     lv_dropdown_set_selected(fox_target_dd, sel);
 }
-
 #endif /* FOX_HUNT_HAS_NIMBLE */
 
-/* ── Band helpers (available in both builds) ── */
+/* ── Band helpers ── */
 static uint32_t fox_band_color(fox_band_t band)
 {
     switch (band) {
@@ -332,10 +304,9 @@ static uint32_t fox_band_color(fox_band_t band)
     case FOX_BAND_WARM:     return 0xFFB800;
     case FOX_BAND_COLD:     return 0x00C8D4;
     case FOX_BAND_FREEZING: return 0x1E6CFF;
-    default:                return 0x303030;
+    default:                return 0x3A3A3A;
     }
 }
-
 static const char *fox_band_text(fox_band_t band)
 {
     switch (band) {
@@ -346,8 +317,6 @@ static const char *fox_band_text(fox_band_t band)
     default:                return "SEARCHING";
     }
 }
-
-/* Pulse period (full cycle) in ms — faster when hotter. */
 static uint32_t fox_band_period(fox_band_t band)
 {
     switch (band) {
@@ -358,7 +327,6 @@ static uint32_t fox_band_period(fox_band_t band)
     default:                return 2200;
     }
 }
-
 static uint16_t fox_band_freq(fox_band_t band)
 {
     switch (band) {
@@ -369,7 +337,6 @@ static uint16_t fox_band_freq(fox_band_t band)
     default:                return 0;
     }
 }
-
 static fox_band_t fox_band_from_rssi(float smoothed)
 {
     int adj = (int)lroundf(smoothed) + fox_range_tune;
@@ -378,16 +345,14 @@ static fox_band_t fox_band_from_rssi(float smoothed)
     if (adj >= FOX_COLD_MIN_DBM) return FOX_BAND_COLD;
     return FOX_BAND_FREEZING;
 }
-
 static float fox_smoothing_alpha(void)
 {
     switch (fox_smoothing_idx) {
-    case 0:  return 0.55f;  /* Low smoothing: fast, jumpy */
-    case 2:  return 0.15f;  /* High smoothing: steady, laggy */
-    default: return 0.30f;  /* Medium */
+    case 0:  return 0.55f;
+    case 2:  return 0.15f;
+    default: return 0.30f;
     }
 }
-
 static const char *fox_fb_text(fox_fb_t fb)
 {
     switch (fb) {
@@ -397,8 +362,6 @@ static const char *fox_fb_text(fox_fb_t fb)
     default:            return "Off";
     }
 }
-
-/* Scale an RGB colour toward black by brightness (0..1). */
 static uint32_t fox_scale_color(uint32_t rgb, float b)
 {
     if (b < 0.0f) {
@@ -413,61 +376,24 @@ static uint32_t fox_scale_color(uint32_t rgb, float b)
     return (r << 16) | (g << 8) | bl;
 }
 
-/* Set an edge panel's gradient direction and anchor its inner end to black.
- * The screen background is black, so a colour->black gradient reads as a
- * colour->transparent fade without needing an alpha gradient or a render
- * layer (which corrupts large panels on this display). */
-static void fox_style_glow_dir(lv_obj_t *panel, uint8_t edge)
-{
-    lv_color_t black = lv_color_black();
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_main_stop(panel, 0, 0);
-    lv_obj_set_style_bg_grad_stop(panel, 255, 0);
-    lv_obj_set_style_bg_grad_dir(panel, (edge < 2) ? LV_GRAD_DIR_VER : LV_GRAD_DIR_HOR, 0);
-    /* edge colour lives on: top/left = main end, bottom/right = grad end. */
-    if (edge == 0 || edge == 2) {
-        lv_obj_set_style_bg_grad_color(panel, black, 0); /* inner end black */
-    } else {
-        lv_obj_set_style_bg_color(panel, black, 0);      /* inner end black */
-    }
-}
-
-/* Apply band colour at the chosen brightness to the four panels' edges. */
-static void fox_apply_glow(uint32_t color, float brightness)
-{
-    lv_color_t lc = lv_color_hex(fox_scale_color(color, brightness));
-    if (fox_glow[0]) {
-        lv_obj_set_style_bg_color(fox_glow[0], lc, 0);
-    }
-    if (fox_glow[2]) {
-        lv_obj_set_style_bg_color(fox_glow[2], lc, 0);
-    }
-    if (fox_glow[1]) {
-        lv_obj_set_style_bg_grad_color(fox_glow[1], lc, 0);
-    }
-    if (fox_glow[3]) {
-        lv_obj_set_style_bg_grad_color(fox_glow[3], lc, 0);
-    }
-}
-
 static void fox_update_vol_label(void)
 {
     if (fox_vol_label) {
-        lv_label_set_text_fmt(fox_vol_label, LV_SYMBOL_VOLUME_MAX " %u/%u",
-                              (unsigned)fox_volume, (unsigned)FOX_VOL_MAX);
-    }
-    if (fox_fb_label) {
-        lv_label_set_text(fox_fb_label, fox_volume == 0 ? "Silent" : fox_fb_text(fox_feedback));
+        if (fox_volume == 0) {
+            lv_label_set_text(fox_vol_label, LV_SYMBOL_MUTE " 0/5");
+        } else {
+            lv_label_set_text_fmt(fox_vol_label, LV_SYMBOL_VOLUME_MAX " %u/%u  %s",
+                                  (unsigned)fox_volume, (unsigned)FOX_VOL_MAX,
+                                  fox_fb_text(fox_feedback));
+        }
     }
 }
 
-/* Fire haptic/beep on a glow crest, honouring type + volume. */
 static void fox_emit_feedback(fox_band_t band)
 {
     if (fox_volume == 0 || band == FOX_BAND_NONE) {
         return;
     }
-    /* At low volume, skip every other crest to thin the cadence out. */
     static bool skip = false;
     if (fox_volume <= 2) {
         skip = !skip;
@@ -475,7 +401,6 @@ static void fox_emit_feedback(fox_band_t band)
             return;
         }
     }
-
 #ifdef ARDUINO
     bool want_haptic = (fox_feedback == FOX_FB_HAPTIC || fox_feedback == FOX_FB_BOTH);
     bool want_beep   = (fox_feedback == FOX_FB_BEEP   || fox_feedback == FOX_FB_BOTH);
@@ -484,7 +409,7 @@ static void fox_emit_feedback(fox_band_t band)
     }
     if (want_beep && fox_has_codec) {
         uint16_t freq = fox_band_freq(band);
-        uint16_t dur = (uint16_t)(20 + fox_volume * 8); /* 28..60ms */
+        uint16_t dur = (uint16_t)(20 + fox_volume * 8);
         if (freq) {
             hw_audio_beep(freq, dur);
         }
@@ -494,80 +419,41 @@ static void fox_emit_feedback(fox_band_t band)
 #endif
 }
 
-/* ── Settings modal ── */
-static void fox_settings_close_cb(lv_event_t *e);
-static void fox_smoothing_cb(lv_event_t *e);
-static void fox_range_cb(lv_event_t *e);
-static void fox_feedback_cb(lv_event_t *e);
-
-static void fox_open_settings(void)
-{
-    if (fox_settings || !fox_root) {
-        return;
-    }
-    fox_settings = lv_obj_create(fox_root);
-    lv_obj_set_size(fox_settings, 212, 224);
-    lv_obj_center(fox_settings);
-    lv_obj_set_style_bg_color(fox_settings, lv_color_hex(0x101010), 0);
-    lv_obj_set_style_bg_opa(fox_settings, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(fox_settings, UI_COLOR_DIVIDER, 0);
-    lv_obj_set_style_border_width(fox_settings, 1, 0);
-    lv_obj_set_style_radius(fox_settings, 12, 0);
-    lv_obj_set_style_pad_all(fox_settings, 10, 0);
-    lv_obj_set_flex_flow(fox_settings, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(fox_settings, 8, 0);
-
-    lv_obj_t *title = lv_label_create(fox_settings);
-    lv_label_set_text(title, "Fox Hunt Settings");
-    lv_obj_set_style_text_color(title, UI_COLOR_TEXT_PRIMARY, 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-
-    lv_obj_t *l1 = lv_label_create(fox_settings);
-    lv_label_set_text(l1, "Smoothing");
-    lv_obj_set_style_text_color(l1, UI_COLOR_TEXT_SECONDARY, 0);
-    lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
-    lv_obj_t *sm = lv_dropdown_create(fox_settings);
-    lv_dropdown_set_options(sm, "Low\nMedium\nHigh");
-    lv_dropdown_set_selected(sm, fox_smoothing_idx);
-    lv_obj_set_width(sm, LV_PCT(100));
-    lv_obj_add_event_cb(sm, fox_smoothing_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *l2 = lv_label_create(fox_settings);
-    lv_label_set_text_fmt(l2, "Range tune: %+d dB", fox_range_tune);
-    lv_obj_set_style_text_color(l2, UI_COLOR_TEXT_SECONDARY, 0);
-    lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
-    lv_obj_t *rng = lv_slider_create(fox_settings);
-    lv_slider_set_range(rng, -10, 10);
-    lv_slider_set_value(rng, fox_range_tune, LV_ANIM_OFF);
-    lv_obj_set_width(rng, LV_PCT(100));
-    lv_obj_add_event_cb(rng, fox_range_cb, LV_EVENT_VALUE_CHANGED, l2);
-
-    lv_obj_t *l3 = lv_label_create(fox_settings);
-    lv_label_set_text(l3, "Feedback");
-    lv_obj_set_style_text_color(l3, UI_COLOR_TEXT_SECONDARY, 0);
-    lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
-    lv_obj_t *fb = lv_dropdown_create(fox_settings);
-    lv_dropdown_set_options(fb, "Off\nHaptic\nBeep\nBuzz+Beep");
-    lv_dropdown_set_selected(fb, (uint16_t)fox_feedback);
-    lv_obj_set_width(fb, LV_PCT(100));
-    lv_obj_add_event_cb(fb, fox_feedback_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *close = lv_btn_create(fox_settings);
-    lv_obj_set_width(close, LV_PCT(100));
-    lv_obj_set_style_bg_color(close, UI_COLOR_ACCENT, 0);
-    lv_obj_add_event_cb(close, fox_settings_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *cl = lv_label_create(close);
-    lv_label_set_text(cl, "Close");
-    lv_obj_center(cl);
-}
-
-static void fox_settings_close_cb(lv_event_t *e)
+/* ── Event handlers ── */
+static void fox_target_cb(lv_event_t *e)
 {
     (void)e;
-    if (fox_settings) {
-        lv_obj_del(fox_settings);
-        fox_settings = NULL;
+#if FOX_HUNT_HAS_NIMBLE
+    uint16_t sel = lv_dropdown_get_selected(fox_target_dd);
+    if (sel == 0) {
+        fox_target_addr.clear();
+        fox_target_type = 0;
+    } else if ((size_t)(sel - 1) < fox_pick_map.size()) {
+        fox_target_addr = fox_pick_map[sel - 1].first;
+        fox_target_type = fox_pick_map[sel - 1].second;
     }
+    fox_have_smoothed = false;
+#endif
+}
+
+static void fox_vol_slider_cb(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target_obj(e);
+    int v = lv_slider_get_value(sl);
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > FOX_VOL_MAX) {
+        v = FOX_VOL_MAX;
+    }
+    fox_volume = (uint8_t)v;
+    fox_update_vol_label();
+}
+
+static void fox_feedback_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target_obj(e);
+    fox_feedback = (fox_fb_t)lv_dropdown_get_selected(dd);
     fox_update_vol_label();
 }
 
@@ -581,85 +467,37 @@ static void fox_range_cb(lv_event_t *e)
 {
     lv_obj_t *sl = lv_event_get_target_obj(e);
     fox_range_tune = (int8_t)lv_slider_get_value(sl);
-    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
-    if (lbl) {
-        lv_label_set_text_fmt(lbl, "Range tune: %+d dB", fox_range_tune);
-    }
 }
 
-static void fox_feedback_cb(lv_event_t *e)
-{
-    lv_obj_t *dd = lv_event_get_target_obj(e);
-    fox_feedback = (fox_fb_t)lv_dropdown_get_selected(dd);
-}
-
-/* ── Event handlers ── */
-static void fox_gear_cb(lv_event_t *e)
+/* Tap the signal panel's left/right half to change feedback volume. */
+static void fox_panel_click_cb(lv_event_t *e)
 {
     (void)e;
-    fox_open_settings();
-}
-
-static void fox_target_cb(lv_event_t *e)
-{
-    (void)e;
-#if FOX_HUNT_HAS_NIMBLE
-    uint16_t sel = lv_dropdown_get_selected(fox_target_dd);
-    if (sel == 0) {
-        fox_target_addr.clear();
-        fox_target_type = 0;
-    } else if ((size_t)(sel - 1) < fox_pick_map.size()) {
-        fox_target_addr = fox_pick_map[sel - 1].first;
-        fox_target_type = fox_pick_map[sel - 1].second;
-    }
-    fox_have_smoothed = false; /* restart smoothing for the new target */
-#endif
-}
-
-/* Tap the left/right third (away from the bezel) to change volume. */
-static void fox_root_click_cb(lv_event_t *e)
-{
-    if (fox_settings) {
-        return; /* modal open — ignore background taps */
-    }
     lv_indev_t *indev = lv_indev_active();
-    if (!indev || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+    if (!indev || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER || !fox_signal_panel) {
         return;
     }
     lv_point_t p;
     lv_indev_get_point(indev, &p);
-
-    int32_t w = lv_obj_get_width(fox_root);
-    int32_t h = lv_obj_get_height(fox_root);
-    if (w <= 0) {
-        w = 240;
-    }
-    if (h <= 0) {
-        h = 240;
-    }
-    /* keep the top bar and the bezel swipe margins out of it */
-    if (p.y < 40 || p.y > h - 24) {
-        return;
-    }
-    if (p.x < FOX_EDGE_MARGIN || p.x > w - FOX_EDGE_MARGIN) {
-        return;
-    }
-
-    if (p.x < w / 2 - 8) {
+    lv_area_t a;
+    lv_obj_get_coords(fox_signal_panel, &a);
+    int32_t mid = (a.x1 + a.x2) / 2;
+    if (p.x < mid) {
         if (fox_volume > 0) {
             fox_volume--;
         }
-    } else if (p.x > w / 2 + 8) {
+    } else {
         if (fox_volume < FOX_VOL_MAX) {
             fox_volume++;
         }
-    } else {
-        return;
+    }
+    if (fox_vol_slider) {
+        lv_slider_set_value(fox_vol_slider, fox_volume, LV_ANIM_OFF);
     }
     fox_update_vol_label();
 #ifdef ARDUINO
     if (fox_volume > 0 && fox_has_haptic) {
-        hw_feedback(); /* confirm the change */
+        hw_feedback();
     }
 #endif
 }
@@ -670,20 +508,17 @@ static void fox_back_cb(lv_event_t *e)
 {
     (void)e;
     fox_cleanup();
-    if (fox_root) {
-        lv_obj_del(fox_root);
-        fox_root = NULL;
+    if (fox_page) {
+        ui_destroy_app_page(fox_page);
+        fox_page = NULL;
     }
-    for (uint8_t i = 0; i < 4; i++) {
-        fox_glow[i] = NULL;
-    }
-    fox_back_btn = fox_gear_btn = fox_target_dd = NULL;
-    fox_band_label = fox_rssi_label = fox_sub_label = NULL;
-    fox_vol_label = fox_fb_label = fox_settings = NULL;
+    fox_signal_panel = NULL;
+    fox_band_label = fox_rssi_label = fox_vol_label = fox_sub_label = NULL;
+    fox_target_dd = fox_vol_slider = NULL;
     menu_show();
 }
 
-/* ── Main tick: update smoothing, band, glow, feedback ── */
+/* ── Main tick ── */
 static void fox_tick_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -697,9 +532,7 @@ static void fox_tick_cb(lv_timer_t *timer)
 
 #if FOX_HUNT_HAS_NIMBLE
     have = fox_target_rssi(&raw, &name);
-
-    if (fox_target_dd && now >= fox_next_list_ms &&
-            !lv_dropdown_is_open(fox_target_dd)) {
+    if (fox_target_dd && now >= fox_next_list_ms && !lv_dropdown_is_open(fox_target_dd)) {
         fox_rebuild_target_list();
         fox_next_list_ms = now + FOX_LIST_REBUILD_MS;
     }
@@ -724,10 +557,8 @@ static void fox_tick_cb(lv_timer_t *timer)
         fox_band = band;
         if (fox_band_label) {
             lv_label_set_text(fox_band_label, fox_band_text(band));
-            lv_obj_set_style_text_color(fox_band_label, lv_color_hex(fox_band_color(band)), 0);
         }
     }
-
     if (fox_rssi_label) {
         if (have) {
             lv_label_set_text_fmt(fox_rssi_label, "%d dBm", (int)lroundf(fox_smoothed));
@@ -740,11 +571,11 @@ static void fox_tick_cb(lv_timer_t *timer)
             lv_label_set_text_fmt(fox_sub_label, "%s  (raw %d)",
                                   name.empty() ? "target" : name.c_str(), (int)raw);
         } else {
-            lv_label_set_text(fox_sub_label, "no signal — move around");
+            lv_label_set_text(fox_sub_label, "no signal - move around");
         }
     }
 
-    /* Pulse the glow by scaling edge brightness; cadence tracks the band. */
+    /* Pulse the signal panel colour; cadence tracks the band. */
     uint32_t period = fox_band_period(band);
     fox_pulse_phase_ms += dt;
     bool crest = false;
@@ -752,30 +583,29 @@ static void fox_tick_cb(lv_timer_t *timer)
         fox_pulse_phase_ms -= period;
         crest = true;
     }
-    float phase = (float)fox_pulse_phase_ms / (float)period;      /* 0..1 */
-    float wave = 0.5f - 0.5f * cosf(phase * 2.0f * (float)M_PI);  /* 0..1, crest at phase 0/1 */
+    float phase = (float)fox_pulse_phase_ms / (float)period;
+    float wave = 0.5f - 0.5f * cosf(phase * 2.0f * (float)M_PI);
 
     uint32_t color = fox_band_color(band);
     float brightness;
     if (band == FOX_BAND_NONE) {
-        brightness = 0.35f; /* faint steady while searching */
+        brightness = 0.55f;
     } else {
-        float base = 0.40f + 0.06f * (float)band; /* 0.46..0.64 */
-        float amp = 0.30f + 0.05f * (float)band;  /* 0.35..0.50 */
+        float base = 0.45f + 0.05f * (float)band;
+        float amp = 0.28f + 0.05f * (float)band;
         brightness = base + amp * wave;
         if (brightness > 1.0f) {
             brightness = 1.0f;
         }
     }
-    /* Quantise to limit gradient redraws. */
     int qb = (int)(brightness * 12.0f + 0.5f);
-    if (qb != fox_last_qb || color != fox_last_glow_color) {
-        fox_apply_glow(color, (float)qb / 12.0f);
+    if (fox_signal_panel && (qb != fox_last_qb || color != fox_last_panel_color)) {
+        lv_obj_set_style_bg_color(fox_signal_panel, lv_color_hex(fox_scale_color(color, (float)qb / 12.0f)), 0);
+        lv_obj_set_style_border_color(fox_signal_panel, lv_color_hex(color), 0);
         fox_last_qb = qb;
-        fox_last_glow_color = color;
+        fox_last_panel_color = color;
     }
 
-    /* Feedback on the crest. */
     if (crest && !fox_crest_latched) {
         fox_emit_feedback(band);
     }
@@ -808,7 +638,7 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
     fox_next_list_ms = 0;
     fox_crest_latched = false;
     fox_last_qb = -1;
-    fox_last_glow_color = 0xFFFFFFFFu;
+    fox_last_panel_color = 0xFFFFFFFFu;
 
 #ifdef ARDUINO
     uint32_t online = hw_get_device_online();
@@ -816,119 +646,65 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
     fox_has_haptic = (online & HW_DRV_ONLINE) != 0;
 #endif
 
-    /* Full-screen root (no card page — this is an immersive view). */
-    fox_root = lv_obj_create(parent);
-    lv_obj_set_size(fox_root, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(fox_root, UI_COLOR_BG, 0);
-    lv_obj_set_style_bg_opa(fox_root, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(fox_root, 0, 0);
-    lv_obj_set_style_radius(fox_root, 0, 0);
-    lv_obj_set_style_pad_all(fox_root, 0, 0);
-    lv_obj_remove_flag(fox_root, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(fox_root, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(fox_root, fox_root_click_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    fox_page = ui_create_app_page(parent, "Fox Hunt", fox_back_cb);
 
-    int32_t sw = lv_display_get_horizontal_resolution(NULL);
-    int32_t sh = lv_display_get_vertical_resolution(NULL);
-    if (sw <= 0) {
-        sw = 240;
-    }
-    if (sh <= 0) {
-        sh = 240;
-    }
+    /* Big signal panel (the colour indicator). Tap left/right = volume. */
+    fox_signal_panel = lv_obj_create(fox_page);
+    lv_obj_set_width(fox_signal_panel, LV_PCT(100));
+    lv_obj_set_height(fox_signal_panel, 132);
+    lv_obj_remove_flag(fox_signal_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(fox_signal_panel, 14, 0);
+    lv_obj_set_style_border_width(fox_signal_panel, 3, 0);
+    lv_obj_set_style_border_color(fox_signal_panel, lv_color_hex(fox_band_color(FOX_BAND_NONE)), 0);
+    lv_obj_set_style_bg_color(fox_signal_panel, lv_color_hex(fox_scale_color(fox_band_color(FOX_BAND_NONE), 0.55f)), 0);
+    lv_obj_set_style_bg_opa(fox_signal_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(fox_signal_panel, 6, 0);
+    lv_obj_add_flag(fox_signal_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(fox_signal_panel, fox_panel_click_cb, LV_EVENT_SHORT_CLICKED, NULL);
 
-    /* Edge glow panels (created first => behind everything, non-clickable). */
-    const uint8_t edges[4] = { 0, 1, 2, 3 };
-    const lv_align_t aligns[4] = { LV_ALIGN_TOP_MID, LV_ALIGN_BOTTOM_MID,
-                                   LV_ALIGN_LEFT_MID, LV_ALIGN_RIGHT_MID };
-    for (uint8_t i = 0; i < 4; i++) {
-        lv_obj_t *g = lv_obj_create(fox_root);
-        lv_obj_remove_flag(g, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_remove_flag(g, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_border_width(g, 0, 0);
-        lv_obj_set_style_radius(g, 0, 0);
-        lv_obj_set_style_pad_all(g, 0, 0);
-        if (i < 2) {
-            lv_obj_set_size(g, sw, (sh * 42) / 100);
-        } else {
-            lv_obj_set_size(g, (sw * 42) / 100, sh);
-        }
-        lv_obj_align(g, aligns[i], 0, 0);
-        fox_style_glow_dir(g, edges[i]);
-        fox_glow[i] = g;
-    }
-    fox_apply_glow(fox_band_color(FOX_BAND_NONE), 0.35f);
-
-    /* Top bar: back, target dropdown, gear. */
-    fox_back_btn = lv_btn_create(fox_root);
-    lv_obj_set_size(fox_back_btn, 30, 30);
-    lv_obj_align(fox_back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
-    lv_obj_set_style_radius(fox_back_btn, 15, 0);
-    lv_obj_set_style_bg_color(fox_back_btn, lv_color_hex(0x202020), 0);
-    lv_obj_set_style_border_width(fox_back_btn, 1, 0);
-    lv_obj_set_style_border_color(fox_back_btn, UI_COLOR_DIVIDER, 0);
-    lv_obj_add_event_cb(fox_back_btn, fox_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *bl = lv_label_create(fox_back_btn);
-    lv_label_set_text(bl, LV_SYMBOL_LEFT);
-    lv_obj_center(bl);
-
-    fox_gear_btn = lv_btn_create(fox_root);
-    lv_obj_set_size(fox_gear_btn, 30, 30);
-    lv_obj_align(fox_gear_btn, LV_ALIGN_TOP_RIGHT, -4, 4);
-    lv_obj_set_style_radius(fox_gear_btn, 15, 0);
-    lv_obj_set_style_bg_color(fox_gear_btn, lv_color_hex(0x202020), 0);
-    lv_obj_set_style_border_width(fox_gear_btn, 1, 0);
-    lv_obj_set_style_border_color(fox_gear_btn, UI_COLOR_DIVIDER, 0);
-    lv_obj_add_event_cb(fox_gear_btn, fox_gear_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *gl = lv_label_create(fox_gear_btn);
-    lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
-    lv_obj_center(gl);
-
-    fox_target_dd = lv_dropdown_create(fox_root);
-    lv_dropdown_set_options(fox_target_dd, "Auto (strongest)");
-    lv_obj_set_width(fox_target_dd, sw - 80);
-    lv_obj_set_height(fox_target_dd, 30);
-    lv_obj_align(fox_target_dd, LV_ALIGN_TOP_MID, 0, 4);
-    lv_obj_set_style_pad_ver(fox_target_dd, 4, 0);
-    lv_obj_set_style_text_font(fox_target_dd, &lv_font_montserrat_12, 0);
-    lv_obj_add_event_cb(fox_target_dd, fox_target_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    /* Centre readout. */
-    fox_band_label = lv_label_create(fox_root);
+    fox_band_label = lv_label_create(fox_signal_panel);
     lv_label_set_text(fox_band_label, fox_band_text(FOX_BAND_NONE));
-    lv_obj_set_style_text_font(fox_band_label, &lv_font_montserrat_40, 0);
-    lv_obj_set_style_text_color(fox_band_label, lv_color_hex(fox_band_color(FOX_BAND_NONE)), 0);
-    lv_obj_align(fox_band_label, LV_ALIGN_CENTER, 0, -22);
+    lv_obj_set_style_text_font(fox_band_label, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(fox_band_label, lv_color_white(), 0);
+    lv_obj_align(fox_band_label, LV_ALIGN_TOP_MID, 0, 2);
 
-    fox_rssi_label = lv_label_create(fox_root);
+    fox_rssi_label = lv_label_create(fox_signal_panel);
     lv_label_set_text(fox_rssi_label, "-- dBm");
     lv_obj_set_style_text_font(fox_rssi_label, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(fox_rssi_label, UI_COLOR_TEXT_PRIMARY, 0);
-    lv_obj_align(fox_rssi_label, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_text_color(fox_rssi_label, lv_color_white(), 0);
+    lv_obj_align(fox_rssi_label, LV_ALIGN_CENTER, 0, 10);
 
-    fox_sub_label = lv_label_create(fox_root);
-    lv_label_set_text(fox_sub_label, "no signal — move around");
-    lv_label_set_long_mode(fox_sub_label, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(fox_sub_label, sw - 2 * FOX_EDGE_MARGIN);
-    lv_obj_set_style_text_align(fox_sub_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(fox_sub_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(fox_sub_label, UI_COLOR_TEXT_SECONDARY, 0);
-    lv_obj_align(fox_sub_label, LV_ALIGN_CENTER, 0, 52);
-
-    /* Bottom status: volume (left) and feedback type (right). */
-    fox_vol_label = lv_label_create(fox_root);
+    fox_vol_label = lv_label_create(fox_signal_panel);
     lv_obj_set_style_text_font(fox_vol_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(fox_vol_label, UI_COLOR_TEXT_PRIMARY, 0);
-    lv_obj_align(fox_vol_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_set_style_text_color(fox_vol_label, lv_color_white(), 0);
+    lv_obj_align(fox_vol_label, LV_ALIGN_BOTTOM_MID, 0, 0);
 
-    fox_fb_label = lv_label_create(fox_root);
-    lv_obj_set_style_text_font(fox_fb_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(fox_fb_label, UI_COLOR_TEXT_SECONDARY, 0);
-    lv_obj_align(fox_fb_label, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    /* Target */
+    lv_obj_t *target_card = ui_create_card(fox_page, "Target");
+    fox_target_dd = ui_create_card_dropdown(target_card, LV_SYMBOL_BLUETOOTH, "Hunt",
+                                            "Auto (strongest)", 0, fox_target_cb);
+    fox_sub_label = lv_label_create(target_card);
+    lv_label_set_text(fox_sub_label, "no signal - move around");
+    lv_label_set_long_mode(fox_sub_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fox_sub_label, LV_PCT(100));
+    lv_obj_set_style_text_font(fox_sub_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fox_sub_label, UI_COLOR_TEXT_SECONDARY, 0);
+
+    /* Feedback */
+    lv_obj_t *fb_card = ui_create_card(fox_page, "Feedback");
+    fox_vol_slider = ui_create_card_slider(fb_card, LV_SYMBOL_VOLUME_MAX, "Volume",
+                                           0, FOX_VOL_MAX, fox_volume, fox_vol_slider_cb);
+    ui_create_card_dropdown(fb_card, LV_SYMBOL_BELL, "Type",
+                            "Off\nHaptic\nBeep\nBuzz+Beep", (uint8_t)fox_feedback, fox_feedback_cb);
+
+    /* Tuning */
+    lv_obj_t *tune_card = ui_create_card(fox_page, "Tuning");
+    ui_create_card_dropdown(tune_card, LV_SYMBOL_SETTINGS, "Smoothing",
+                            "Low\nMedium\nHigh", fox_smoothing_idx, fox_smoothing_cb);
+    ui_create_card_slider(tune_card, LV_SYMBOL_SETTINGS, "Range dB",
+                          -10, 10, fox_range_tune, fox_range_cb);
+
     fox_update_vol_label();
-
-    /* Bezel swipe to go back. */
-    ui_enable_edge_swipe_back(fox_root, fox_back_btn);
 
 #if FOX_HUNT_HAS_NIMBLE
     if (!fox_mutex) {
@@ -941,10 +717,8 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
     fox_target_addr.clear();
     fox_target_type = 0;
     fox_app_active = true;
-    if (!fox_start_scan()) {
-        if (fox_sub_label) {
-            lv_label_set_text(fox_sub_label, "BLE scan failed to start");
-        }
+    if (!fox_start_scan() && fox_sub_label) {
+        lv_label_set_text(fox_sub_label, "BLE scan failed to start");
     }
     fox_timer = lv_timer_create(fox_tick_cb, FOX_UI_PERIOD_MS, NULL);
 #else
