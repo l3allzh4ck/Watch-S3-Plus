@@ -96,8 +96,12 @@ static uint32_t fox_next_list_ms = 0;
 static bool    fox_crest_latched = false;
 static bool    fox_has_codec = false;
 static bool    fox_has_haptic = false;
-static int     fox_last_qb = -1;
-static uint32_t fox_last_panel_color = 0xFFFFFFFFu;
+static uint32_t fox_next_ui_ms = 0;      /* throttle display writes */
+static int     fox_last_dbm = 999;
+static int     fox_last_sub_raw = 999;
+static bool    fox_last_have = false;
+
+#define FOX_UI_REFRESH_MS       250      /* how often labels repaint */
 
 #if FOX_HUNT_HAS_NIMBLE
 typedef struct {
@@ -564,29 +568,46 @@ static void fox_tick_cb(lv_timer_t *timer)
         band = FOX_BAND_NONE;
     }
 
+    /* Recolour the big panel only on a band change (a large repaint — doing it
+     * every tick tears this partial-refresh display). */
     if (band != fox_band) {
         fox_band = band;
+        uint32_t color = fox_band_color(band);
+        if (fox_signal_panel) {
+            lv_obj_set_style_bg_color(fox_signal_panel, lv_color_hex(fox_scale_color(color, 0.80f)), 0);
+            lv_obj_set_style_border_color(fox_signal_panel, lv_color_hex(color), 0);
+        }
         if (fox_band_label) {
             lv_label_set_text(fox_band_label, fox_band_text(band));
         }
     }
-    if (fox_rssi_label) {
-        if (have) {
-            lv_label_set_text_fmt(fox_rssi_label, "%d dBm", (int)lroundf(fox_smoothed));
-        } else {
-            lv_label_set_text(fox_rssi_label, "-- dBm");
+
+    /* Throttle text updates (small areas only) to a gentle rate. */
+    bool ui_due = (now >= fox_next_ui_ms);
+    if (ui_due) {
+        fox_next_ui_ms = now + FOX_UI_REFRESH_MS;
+        int dbm = have ? (int)lroundf(fox_smoothed) : 999;
+        if (fox_rssi_label && dbm != fox_last_dbm) {
+            if (have) {
+                lv_label_set_text_fmt(fox_rssi_label, "%d dBm", dbm);
+            } else {
+                lv_label_set_text(fox_rssi_label, "-- dBm");
+            }
+            fox_last_dbm = dbm;
         }
-    }
-    if (fox_sub_label) {
-        if (have) {
-            lv_label_set_text_fmt(fox_sub_label, "%s  (raw %d)",
-                                  name.empty() ? "target" : name.c_str(), (int)raw);
-        } else {
-            lv_label_set_text(fox_sub_label, "no signal - move around");
+        if (fox_sub_label && ((int)raw != fox_last_sub_raw || have != fox_last_have)) {
+            if (have) {
+                lv_label_set_text_fmt(fox_sub_label, "%s  (raw %d)",
+                                      name.empty() ? "target" : name.c_str(), (int)raw);
+            } else {
+                lv_label_set_text(fox_sub_label, "no signal - move around");
+            }
+            fox_last_sub_raw = (int)raw;
+            fox_last_have = have;
         }
     }
 
-    /* Pulse the signal panel colour; cadence tracks the band. */
+    /* Feedback cadence tracks the band (no display work). */
     uint32_t period = fox_band_period(band);
     fox_pulse_phase_ms += dt;
     bool crest = false;
@@ -594,29 +615,6 @@ static void fox_tick_cb(lv_timer_t *timer)
         fox_pulse_phase_ms -= period;
         crest = true;
     }
-    float phase = (float)fox_pulse_phase_ms / (float)period;
-    float wave = 0.5f - 0.5f * cosf(phase * 2.0f * (float)M_PI);
-
-    uint32_t color = fox_band_color(band);
-    float brightness;
-    if (band == FOX_BAND_NONE) {
-        brightness = 0.55f;
-    } else {
-        float base = 0.45f + 0.05f * (float)band;
-        float amp = 0.28f + 0.05f * (float)band;
-        brightness = base + amp * wave;
-        if (brightness > 1.0f) {
-            brightness = 1.0f;
-        }
-    }
-    int qb = (int)(brightness * 12.0f + 0.5f);
-    if (fox_signal_panel && (qb != fox_last_qb || color != fox_last_panel_color)) {
-        lv_obj_set_style_bg_color(fox_signal_panel, lv_color_hex(fox_scale_color(color, (float)qb / 12.0f)), 0);
-        lv_obj_set_style_border_color(fox_signal_panel, lv_color_hex(color), 0);
-        fox_last_qb = qb;
-        fox_last_panel_color = color;
-    }
-
     if (crest && !fox_crest_latched) {
         fox_emit_feedback(band);
     }
@@ -648,8 +646,10 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
     fox_last_tick_ms = 0;
     fox_next_list_ms = 0;
     fox_crest_latched = false;
-    fox_last_qb = -1;
-    fox_last_panel_color = 0xFFFFFFFFu;
+    fox_next_ui_ms = 0;
+    fox_last_dbm = 999;
+    fox_last_sub_raw = 999;
+    fox_last_have = false;
 
 #ifdef ARDUINO
     uint32_t online = hw_get_device_online();
