@@ -42,9 +42,9 @@ using std::string;
 #include <math.h>
 
 /* ── Tunables ── */
-#define FOX_UI_PERIOD_MS        100
-#define FOX_STALE_MS            4000
-#define FOX_LIST_REBUILD_MS     1500
+#define FOX_UI_PERIOD_MS        200
+#define FOX_STALE_MS            5000
+#define FOX_LIST_REBUILD_MS     2000
 #define FOX_MAX_DEVICES         48
 #define FOX_MAX_PICK            16
 #define FOX_VOL_MAX             5
@@ -190,9 +190,13 @@ static bool fox_start_scan(void)
         return false;
     }
     scan->setScanCallbacks(&fox_scan_cb, false);
-    scan->setActiveScan(true);
-    scan->setInterval(80);
-    scan->setWindow(80);
+    /* Passive, low duty cycle: continuous active scanning starves the
+     * PSRAM->panel DMA flush on this board and tears the display. Passive
+     * (no scan-request TX) with a ~20% listen window keeps RSSI fresh for
+     * hunting while leaving the display pipeline alone. */
+    scan->setActiveScan(false);
+    scan->setInterval(200);  /* 0.625ms units -> 125ms */
+    scan->setWindow(40);     /* -> 25ms listen (~20% duty) */
     scan->setMaxResults(0);
     return scan->start(0, false, true);
 }
@@ -217,7 +221,7 @@ static bool fox_target_rssi(int8_t *rssi_out, string *name_out)
     bool found = false;
     int8_t best = -128;
     uint32_t now = millis();
-    if (!fox_lock(pdMS_TO_TICKS(10))) {
+    if (!fox_lock(0)) { /* never stall the display thread on the scan lock */
         return false;
     }
     if (fox_target_addr.empty()) {
@@ -256,7 +260,7 @@ static bool fox_target_rssi(int8_t *rssi_out, string *name_out)
 
 static void fox_rebuild_target_list(void)
 {
-    if (!fox_target_dd || !fox_lock(pdMS_TO_TICKS(10))) {
+    if (!fox_target_dd || !fox_lock(0)) {
         return;
     }
     vector<fox_device_t> snap = fox_devices;
