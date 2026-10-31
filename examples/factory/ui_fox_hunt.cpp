@@ -362,6 +362,17 @@ static const char *fox_fb_text(fox_fb_t fb)
     default:            return "Off";
     }
 }
+/* ui_create_card_* helpers return the row, not the widget; the widget is the
+ * row's last child. Fetch it so we can drive the dropdown/slider directly. */
+static lv_obj_t *fox_item_widget(lv_obj_t *row)
+{
+    if (!row) {
+        return NULL;
+    }
+    uint32_t n = lv_obj_get_child_count(row);
+    return n ? lv_obj_get_child(row, n - 1) : NULL;
+}
+
 static uint32_t fox_scale_color(uint32_t rgb, float b)
 {
     if (b < 0.0f) {
@@ -681,8 +692,9 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
 
     /* Target */
     lv_obj_t *target_card = ui_create_card(fox_page, "Target");
-    fox_target_dd = ui_create_card_dropdown(target_card, LV_SYMBOL_BLUETOOTH, "Hunt",
-                                            "Auto (strongest)", 0, fox_target_cb);
+    fox_target_dd = fox_item_widget(
+        ui_create_card_dropdown(target_card, LV_SYMBOL_BLUETOOTH, "Hunt",
+                                "Auto (strongest)", 0, fox_target_cb));
     fox_sub_label = lv_label_create(target_card);
     lv_label_set_text(fox_sub_label, "no signal - move around");
     lv_label_set_long_mode(fox_sub_label, LV_LABEL_LONG_DOT);
@@ -692,8 +704,9 @@ void ui_fox_hunt_enter(lv_obj_t *parent)
 
     /* Feedback */
     lv_obj_t *fb_card = ui_create_card(fox_page, "Feedback");
-    fox_vol_slider = ui_create_card_slider(fb_card, LV_SYMBOL_VOLUME_MAX, "Volume",
-                                           0, FOX_VOL_MAX, fox_volume, fox_vol_slider_cb);
+    fox_vol_slider = fox_item_widget(
+        ui_create_card_slider(fb_card, LV_SYMBOL_VOLUME_MAX, "Volume",
+                              0, FOX_VOL_MAX, fox_volume, fox_vol_slider_cb));
     ui_create_card_dropdown(fb_card, LV_SYMBOL_BELL, "Type",
                             "Off\nHaptic\nBeep\nBuzz+Beep", (uint8_t)fox_feedback, fox_feedback_cb);
 
